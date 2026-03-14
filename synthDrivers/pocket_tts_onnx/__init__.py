@@ -15,6 +15,7 @@ import synthDriverHandler
 from synthDriverHandler import (
     SynthDriver as BaseSynthDriver,
     VoiceInfo,
+    NumericDriverSetting,
     synthIndexReached,
     synthDoneSpeaking,
 )
@@ -58,46 +59,53 @@ class _SynthQueueThread(threading.Thread):
                 continue
 
             self.cancel_event.clear()
-            text, voice_data, index = request
-            
+            text, voice_path, indices = request  # indices is a list
+
             try:
-                if self.cancel_event.is_set() or (not text and index is None) or not self.driver.tts_engine:
-                    self._finish_request(index)
+                if self.cancel_event.is_set() or not self.driver.tts_engine:
+                    self._finish_request(indices)
                     continue
 
-                # If there is text to speak
                 if text and text.strip():
-                    # Use the pre-calculated embedding directly for maximum speed
                     audio_stream = self.driver.tts_engine.stream(
-                        text=text, 
-                        voice=voice_data,
-                        target_buffer_sec=0.2
+                        text=text,
+                        voice=voice_path,
+                        target_buffer_sec=0.2,
                     )
 
-                    # Optimization: Pre-calculate conversion factor to reduce CPU load in the loop
-                    # Factor lowered to 1.2 to prevent digital clipping
-                    volume_multiplier = (self.driver._volume / 100.0) * 1.2
-                    conversion_factor = volume_multiplier * 32767
+                    volume_factor = self.driver._volume / 100.0
 
                     for chunk in audio_stream:
-                        if self.cancel_event.is_set(): 
+                        if self.cancel_event.is_set():
                             break
                         if chunk is not None and self.driver._player:
-                            # Direct processing: Clipping at the integer level is faster and prevents crackling
-                            processed_audio = np.clip(chunk * conversion_factor, -32767, 32767).astype(np.int16)
-                            self.driver._player.feed(processed_audio.tobytes())
-                
-                self._finish_request(index)
+                            pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
+                            self.driver._player.feed(
+                                (pcm * 32767).astype(np.int16).tobytes()
+                            )
+
+                # Wait for the WavePlayer buffer to drain before signalling
+                # completion. Without this the next utterance starts while
+                # audio is still playing, cutting off the end of the sentence.
+                if self.driver._player and not self.cancel_event.is_set():
+                    try:
+                        self.driver._player.waitDone()
+                    except Exception:
+                        pass
+                self._finish_request(indices)
             except Exception as e:
                 log.error(f"Pocket TTS ONNX: Synthesis error: {e}")
-                self._finish_request(index)
+                self._finish_request(indices)
+
         ctypes.windll.ole32.CoUninitialize()
 
-    def _finish_request(self, index):
-        if index is not None and not self.cancel_event.is_set():
-            synthIndexReached.notify(synth=self.driver, index=index)
+    def _finish_request(self, indices):
+        if not self.cancel_event.is_set():
+            for idx in (indices or []):
+                synthIndexReached.notify(synth=self.driver, index=idx)
         self.driver._request_queue.task_done()
         synthDoneSpeaking.notify(synth=self.driver)
+
 
 # =========================================================================
 # MAIN SYNTHDRIVER CLASS
@@ -113,29 +121,24 @@ class SynthDriver(BaseSynthDriver):
 
     def __init__(self):
         super(SynthDriver, self).__init__()
-        
-        # Determine the correct base path for models
-        # If in secure mode, we must use the systemConfig path explicitly
+
         if globalVars.appArgs.secure:
             self.models_root = os.path.join(r"C:\Program Files\NVDA\systemConfig", "pocket_tts")
         else:
             self.models_root = os.path.join(globalVars.appArgs.configPath, "pocket_tts")
-        
-        # Configure paths based on the root
+
         self.models_dir = os.path.join(self.models_root, "onnx")
         self.tokenizer_path = os.path.join(self.models_root, "tokenizer.model")
         self.voices_dir = os.path.join(self.models_root, "voices")
-        
-        # Create directories if they do not exist (only in non-secure mode to avoid permission errors)
-        if not globalVars.appArgs.secure:
-            if not os.path.exists(self.voices_dir): 
-                os.makedirs(self.voices_dir, exist_ok=True)
-            if not os.path.exists(self.models_dir):
-                os.makedirs(self.models_dir, exist_ok=True)
 
-        self._current_voice = ""
-        self._current_embedding = None
+        if not globalVars.appArgs.secure:
+            os.makedirs(self.voices_dir, exist_ok=True)
+            os.makedirs(self.models_dir, exist_ok=True)
+
+        self._current_voice_id = ""
+        self._current_voice_path = None  # str path passed directly to the engine
         self._volume = 80
+        self._eos_threshold = -2.0
         self.tts_engine = None
         self._player = None
         self._available_voices = OrderedDict()
@@ -149,95 +152,166 @@ class SynthDriver(BaseSynthDriver):
 
     supportedCommands = frozenset([IndexCommand, VolumeCommand, BreakCommand])
     supportedNotifications = frozenset([synthIndexReached, synthDoneSpeaking])
-    supportedSettings = (BaseSynthDriver.VoiceSetting(), BaseSynthDriver.VolumeSetting())
+    supportedSettings = (
+        BaseSynthDriver.VoiceSetting(),
+        BaseSynthDriver.VolumeSetting(),
+        NumericDriverSetting(
+            "eosThreshold",
+            # Translators: Label for the EOS sensitivity setting in NVDA speech settings
+            _("End-of-sentence sensitivity (EOS)"),
+            availableInSettingsRing=True,
+            minVal=0,
+            maxVal=100,
+        ),
+    )
 
     def _scan_voices(self):
-        """Searches for .wav and .npy files in the new user folder location."""
+        """Scan for .wav and .npy voice files in the user voices folder."""
         self._available_voices.clear()
-        # Now only scans in the new external folders
-        files = glob.glob(os.path.join(self.voices_dir, "*.*")) + glob.glob(os.path.join(self.models_root, "*.*"))
+        files = (
+            glob.glob(os.path.join(self.voices_dir, "*.npy"))
+            + glob.glob(os.path.join(self.voices_dir, "*.wav"))
+        )
         seen = set()
         for path in files:
             name, ext = os.path.splitext(os.path.basename(path))
-            if ext.lower() in [".wav", ".npy"] and name not in seen:
-                self._available_voices[name] = VoiceInfo(name, name.replace("_", " ").title())
+            if name not in seen:
+                self._available_voices[name] = VoiceInfo(
+                    name, name.replace("_", " ").title()
+                )
                 seen.add(name)
-        if self._available_voices and not self._current_voice:
-            self._current_voice = list(self._available_voices.keys())[0]
 
-    def _load_voice_embedding(self, voice_id):
-        """Loads embedding from disk (.npy) or generates it once (.wav) from the user folder."""
-        if not self.tts_engine: return
-        for ext in [".npy", ".wav"]:
-            for folder in [self.voices_dir, self.models_root]:
-                path = os.path.join(folder, f"{voice_id}{ext}")
-                if os.path.exists(path):
-                    try:
-                        if ext == ".npy":
-                            self._current_embedding = np.load(path)
-                            log.info(f"Pocket TTS: Embedding loaded: {path}")
-                        else:
-                            log.info(f"Pocket TTS: Generating embedding for: {path}")
-                            self._current_embedding = self.tts_engine.encode_voice(path)
-                        return
-                    except Exception as e: log.error(f"Error loading voice {voice_id}: {e}")
+        if self._available_voices and not self._current_voice_id:
+            first = list(self._available_voices.keys())[0]
+            self._current_voice_id = first
+            self._current_voice_path = self._resolve_voice_path(first)
+
+    def _resolve_voice_path(self, voice_id: str) -> str:
+        """Return the full path for a voice id, preferring .npy over .wav."""
+        for ext in (".npy", ".wav"):
+            path = os.path.join(self.voices_dir, f"{voice_id}{ext}")
+            if os.path.exists(path):
+                return path
+        return None
 
     def _initialize_async(self):
         ctypes.windll.ole32.CoInitialize(None)
         try:
-            self._player = WavePlayer(channels=1, samplesPerSec=24000, bitsPerSample=16, purpose=AudioPurpose.SPEECH)
-            self.tts_engine = PocketTTSOnnx(models_dir=self.models_dir, tokenizer_path=self.tokenizer_path, precision="int8")
-            self._load_voice_embedding(self._current_voice)
+            self._player = WavePlayer(
+                channels=1,
+                samplesPerSec=24000,
+                bitsPerSample=16,
+                purpose=AudioPurpose.SPEECH,
+            )
+            # lsd_steps=1 is the recommended default for real-time use (see ONNX README).
+            self.tts_engine = PocketTTSOnnx(
+                models_dir=self.models_dir,
+                tokenizer_path=self.tokenizer_path,
+                precision="int8",
+                lsd_steps=1,
+                eos_threshold=self._eos_threshold,
+            )
             self._engine_loaded_event.set()
             log.info("Pocket TTS ONNX: Ready for use.")
-        except Exception as e: log.error(f"Initialization failed: {e}")
+        except Exception as e:
+            log.error(f"Pocket TTS ONNX: Initialization failed: {e}")
 
-    def _get_availableVoices(self) -> TOrderedDict[str, VoiceInfo]: return self._available_voices
-    def _get_voice(self): return self._current_voice
+    # --- Voice property ---
+
+    def _get_availableVoices(self) -> TOrderedDict[str, VoiceInfo]:
+        return self._available_voices
+
+    def _get_voice(self):
+        return self._current_voice_id
+
     def _set_voice(self, value):
         if value in self._available_voices:
-            self._current_voice = value
-            threading.Thread(target=self._load_voice_embedding, args=(value,), daemon=True).start()
+            self._current_voice_id = value
+            self._current_voice_path = self._resolve_voice_path(value)
 
-    def _get_volume(self): return self._volume
-    def _set_volume(self, value): self._volume = value
+    # --- Volume property ---
+
+    def _get_volume(self):
+        return self._volume
+
+    def _set_volume(self, value):
+        self._volume = value
+
+    # --- EOS threshold property ---
+    # Exposed as a 0-100 slider in NVDA speech settings.
+    # Internally mapped to the logit range [-4.0, 0.0]:
+    #   slider 0   = logit -4.0  (most sensitive, may stop early)
+    #   slider 50  = logit -2.0  (recommended default)
+    #   slider 100 = logit  0.0  (least sensitive, always finishes sentence)
+
+    def _get_eosThreshold(self):
+        # Map internal logit [-4.0, 0.0] -> slider [0, 100]
+        return int((self._eos_threshold + 4.0) / 4.0 * 100)
+
+    def _set_eosThreshold(self, value):
+        # Map slider [0, 100] -> logit [-4.0, 0.0]
+        self._eos_threshold = (value / 100.0) * 4.0 - 4.0
+        if self.tts_engine is not None:
+            self.tts_engine.eos_threshold = self._eos_threshold
+
+    # --- Speech ---
 
     def speak(self, speechSequence):
+        """Process a speech sequence, supporting IndexCommands for 'Read All'.
+
+        NVDA injects IndexCommand objects into the sequence at arbitrary points
+        — including mid-phrase (e.g. between "check" and "her notifications").
+        Splitting on every IndexCommand and sending each fragment as a separate
+        TTS request causes the model to treat each fragment as a new sentence,
+        resetting prosody and intonation mid-utterance.
+
+        Instead we collect ALL text across the entire sequence into one request
+        and carry the *list* of (char_offset, index) pairs alongside it. The
+        worker thread fires each synthIndexReached signal after the audio for
+        its corresponding text position has been fed to the player.
         """
-        Processes the speech sequence, maintaining support for IndexCommands
-        which are vital for 'Read All' functionality.
-        """
-        if not self._engine_loaded_event.is_set() or self._current_embedding is None:
+        if not self._engine_loaded_event.is_set() or self._current_voice_path is None:
             return
 
         text_parts = []
+        # List of (index_value,) collected in order; all fired after audio done.
+        pending_indices = []
+
         for item in speechSequence:
             if isinstance(item, str):
                 text_parts.append(item)
             elif isinstance(item, IndexCommand):
-                # Send accumulated text and the index to the queue
-                combined_text = "".join(text_parts)
-                self._request_queue.put((combined_text, self._current_embedding, item.index))
-                text_parts = []
+                pending_indices.append(item.index)
             elif isinstance(item, VolumeCommand):
-                # Optional: Update volume mid-sequence if supported
                 self._volume = item.value
 
-        # Send any remaining text after the last index
-        remaining_text = "".join(text_parts)
-        if remaining_text.strip():
-            self._request_queue.put((remaining_text, self._current_embedding, None))
+        full_text = "".join(text_parts)
+        if full_text.strip() or pending_indices:
+            self._request_queue.put((full_text, self._current_voice_path, pending_indices))
+
+    def pause(self, switch):
+        """Pause or resume playback. Called by NVDA when the user presses Shift."""
+        if self._player:
+            try:
+                self._player.pause(switch)
+            except Exception:
+                pass
 
     def cancel(self):
         self._worker_thread.cancel_event.set()
         if self._player:
-            try: self._player.stop()
-            except: pass
+            try:
+                self._player.stop()
+            except Exception:
+                pass
         try:
-            while not self._request_queue.empty(): self._request_queue.get_nowait()
-        except queue.Empty: pass
+            while not self._request_queue.empty():
+                self._request_queue.get_nowait()
+        except queue.Empty:
+            pass
 
     def terminate(self):
         self._worker_thread.stop_event.set()
-        if self._player: self._player.close()
+        if self._player:
+            self._player.close()
         self.tts_engine = None
