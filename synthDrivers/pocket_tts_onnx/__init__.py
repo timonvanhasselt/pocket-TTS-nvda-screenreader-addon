@@ -103,8 +103,8 @@ class _SynthQueueThread(threading.Thread):
         if not self.cancel_event.is_set():
             for idx in (indices or []):
                 synthIndexReached.notify(synth=self.driver, index=idx)
+            synthDoneSpeaking.notify(synth=self.driver)
         self.driver._request_queue.task_done()
-        synthDoneSpeaking.notify(synth=self.driver)
 
 
 # =========================================================================
@@ -304,14 +304,18 @@ class SynthDriver(BaseSynthDriver):
                 self._player.stop()
             except Exception:
                 pass
-        try:
-            while not self._request_queue.empty():
+        while not self._request_queue.empty():
+            try:
                 self._request_queue.get_nowait()
-        except queue.Empty:
-            pass
+                self._request_queue.task_done()
+            except queue.Empty:
+                break
 
     def terminate(self):
         self._worker_thread.stop_event.set()
+        # Join the worker thread before releasing resources so it cannot
+        # access _player or tts_engine after they have been freed.
+        self._worker_thread.join(timeout=2.0)
         if self._player:
             self._player.close()
         self.tts_engine = None
