@@ -31,6 +31,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Generator, Optional, Union
 import numpy as np
@@ -117,8 +118,11 @@ class PocketTTSOnnx:
         # Pre-compute s/t buffers for flow matching
         self._precompute_flow_buffers()
 
-        # Cache for voice embeddings
-        self._voice_cache = {}
+        # Cache for voice embeddings. Bounded LRU: keeps the most recently used
+        # entries and evicts the oldest when the limit is reached, preventing
+        # unbounded growth when many voices are used in a session.
+        self._voice_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._voice_cache_max = 8
 
     def _get_providers(self, device: str) -> list:
         """Get ONNX execution providers based on device setting."""
@@ -286,6 +290,7 @@ class PocketTTSOnnx:
 
         # Check cache
         if voice_str in self._voice_cache:
+            self._voice_cache.move_to_end(voice_str)
             return self._voice_cache[voice_str]
 
         # Check if it's a pre-computed numpy file (.npy)
@@ -297,8 +302,11 @@ class PocketTTSOnnx:
         else:
             raise ValueError(f"Voice file '{voice_str}' not found.")
 
-        # Cache and return
+        # Cache with LRU eviction: move to end on hit, pop oldest when full.
         self._voice_cache[voice_str] = embeddings
+        self._voice_cache.move_to_end(voice_str)
+        if len(self._voice_cache) > self._voice_cache_max:
+            self._voice_cache.popitem(last=False)
         return embeddings
 
     # Phonetic expansions for single letters, matching how a screen reader
@@ -549,28 +557,32 @@ class PocketTTSOnnx:
 
         # State tracking
         mimi_state = self._init_state(self.mimi_decoder)
-        generated_latents = []
-        decoded_frames = 0
+        # Pending latents waiting to be decoded. Entries are removed immediately
+        # after decoding so memory is freed as generation progresses rather than
+        # accumulating for the full duration of the utterance.
+        pending_latents = []
+        total_decoded_frames = 0
         playback_start_time = None
         start_time = time.time()
 
         def _decode_chunk(size):
-            nonlocal decoded_frames, mimi_state, playback_start_time
-            chunk = np.concatenate(
-                generated_latents[decoded_frames:decoded_frames + size], axis=1
-            )
+            nonlocal total_decoded_frames, mimi_state, playback_start_time
+            chunk = np.concatenate(pending_latents[:size], axis=1)
+            # Free the decoded latents immediately to avoid accumulating all
+            # generated frames in memory (fix for memory leak on dynamic content).
+            del pending_latents[:size]
             res = self.mimi_decoder.run(None, {"latent": chunk, **mimi_state})
             audio = res[0].squeeze()
             for k, val in enumerate(res[1:]):
                 mimi_state[f"state_{k}"] = val
-            decoded_frames += size
+            total_decoded_frames += size
             if playback_start_time is None:
                 playback_start_time = time.time() - start_time
             return audio
 
         for latent in self._run_flow_lm(voice_emb, text_ids, max_frames):
-            generated_latents.append(latent)
-            pending = len(generated_latents) - decoded_frames
+            pending_latents.append(latent)
+            pending = len(pending_latents)
 
             chunk_size = 0
 
@@ -580,7 +592,7 @@ class PocketTTSOnnx:
                     chunk_size = first_chunk_frames
             else:
                 elapsed = time.time() - start_time
-                audio_decoded_sec = decoded_frames * self.FRAME_DURATION
+                audio_decoded_sec = total_decoded_frames * self.FRAME_DURATION
                 playback_elapsed = elapsed - playback_start_time
                 buffer_sec = audio_decoded_sec - playback_elapsed
 
@@ -597,9 +609,8 @@ class PocketTTSOnnx:
         # Critical: if max_frames was hit, or EOS fired just before a chunk
         # boundary, any pending latents would be silently dropped without this,
         # causing mid-sentence cut-off.
-        remaining = len(generated_latents) - decoded_frames
-        if remaining > 0:
-            yield _decode_chunk(remaining)
+        if pending_latents:
+            yield _decode_chunk(len(pending_latents))
 
     def save_audio(self, audio: np.ndarray, path: Union[str, Path]):
         """Save audio to file."""
