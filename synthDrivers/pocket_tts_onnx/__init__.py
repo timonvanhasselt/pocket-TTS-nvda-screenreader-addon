@@ -57,54 +57,119 @@ class _SynthQueueThread(threading.Thread):
                 request = self.driver._request_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-
-            self.cancel_event.clear()
-            text, voice_path, indices = request  # indices is a list
-
             try:
-                if self.cancel_event.is_set() or not self.driver.tts_engine:
-                    self._finish_request(indices)
-                    continue
-
-                if text and text.strip():
-                    audio_stream = self.driver.tts_engine.stream(
-                        text=text,
-                        voice=voice_path,
-                        target_buffer_sec=0.2,
-                    )
-
-                    volume_factor = self.driver._volume / 100.0
-
-                    for chunk in audio_stream:
-                        if self.cancel_event.is_set():
-                            break
-                        if chunk is not None and self.driver._player:
-                            pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
-                            self.driver._player.feed(
-                                (pcm * 32767).astype(np.int16).tobytes()
-                            )
-
-                # Wait for the WavePlayer buffer to drain before signalling
-                # completion. Without this the next utterance starts while
-                # audio is still playing, cutting off the end of the sentence.
-                if self.driver._player and not self.cancel_event.is_set():
-                    try:
-                        self.driver._player.waitDone()
-                    except Exception:
-                        pass
-                self._finish_request(indices)
+                self._process_request(request)
             except Exception as e:
                 log.error(f"Pocket TTS ONNX: Synthesis error: {e}")
-                self._finish_request(indices)
+                gen, _text, _voice, indices = request
+                self._notify_finished(gen, indices)
+            finally:
+                self.driver._request_queue.task_done()
 
         ctypes.windll.ole32.CoUninitialize()
 
-    def _finish_request(self, indices):
-        if not self.cancel_event.is_set():
-            for idx in (indices or []):
-                synthIndexReached.notify(synth=self.driver, index=idx)
-            synthDoneSpeaking.notify(synth=self.driver)
-        self.driver._request_queue.task_done()
+    def _notify_finished(self, gen, indices):
+        """Fire index/doneSpeaking notifications unless the utterance was cancelled."""
+        if gen != self.driver._speech_gen:
+            return
+        for idx in (indices or []):
+            synthIndexReached.notify(synth=self.driver, index=idx)
+        synthDoneSpeaking.notify(synth=self.driver)
+
+    def _process_request(self, request):
+        """Synthesize one utterance and feed it to the WavePlayer.
+
+        Key latency design points:
+
+        * The worker never blocks on playback. The old code called
+          player.waitDone() before picking up the next request, so synthesis
+          of utterance N+1 could not start until the audio of utterance N had
+          fully drained — producing a synthesis-startup gap at every sentence
+          boundary during Say All. Now completion notifications are attached
+          to the audio buffers themselves via player.feed(onDone=...), and the
+          worker immediately moves on to synthesize the next queued utterance
+          while the previous one is still playing. NVDA's WavePlayer queues
+          the audio seamlessly, so speech is continuous.
+
+        * Every request carries the generation counter current at speak()
+          time. cancel() bumps the counter, which instantly invalidates both
+          queued requests and any pending onDone callbacks from audio buffers
+          that were flushed, so stale utterances can neither speak nor fire
+          notifications after a cancel.
+        """
+        driver = self.driver
+        gen, text, voice_path, indices = request
+        if gen != driver._speech_gen:
+            return  # cancelled while sitting in the queue
+        self.cancel_event.clear()
+
+        if not driver.tts_engine:
+            self._notify_finished(gen, indices)
+            return
+
+        # Playback-completion bookkeeping. Each fed buffer gets an onDone
+        # callback tagged with its sequence number; when the buffer carrying
+        # the highest sequence number of this utterance finishes playing, the
+        # utterance's indices and doneSpeaking are fired. This preserves the
+        # original timing semantics (notifications at end of audible speech)
+        # without blocking the worker.
+        tracker = {"final": None, "played": 0, "fired": False}
+        lock = threading.Lock()
+
+        def _make_on_done(seq):
+            def _on_done():
+                if gen != driver._speech_gen:
+                    return
+                with lock:
+                    if seq > tracker["played"]:
+                        tracker["played"] = seq
+                    if (
+                        tracker["final"] is None
+                        or tracker["played"] < tracker["final"]
+                        or tracker["fired"]
+                    ):
+                        return
+                    tracker["fired"] = True
+                self._notify_finished(gen, indices)
+            return _on_done
+
+        fed = 0
+        if text and text.strip():
+            audio_stream = driver.tts_engine.stream(
+                text=text,
+                voice=voice_path,
+                cancel_event=self.cancel_event,
+            )
+            for chunk in audio_stream:
+                if self.cancel_event.is_set() or gen != driver._speech_gen:
+                    break
+                if chunk is None or driver._player is None:
+                    continue
+                volume_factor = driver._volume / 100.0
+                pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
+                fed += 1
+                driver._player.feed(
+                    (pcm * 32767).astype(np.int16).tobytes(),
+                    onDone=_make_on_done(fed),
+                )
+
+        if self.cancel_event.is_set() or gen != driver._speech_gen:
+            return
+
+        if fed == 0:
+            # Nothing audible (e.g. index-only sequence): notify immediately.
+            self._notify_finished(gen, indices)
+            return
+
+        fire_now = False
+        with lock:
+            tracker["final"] = fed
+            if tracker["played"] >= fed and not tracker["fired"]:
+                tracker["fired"] = True
+                fire_now = True
+        if fire_now:
+            # All audio already finished playing before synthesis loop ended.
+            self._notify_finished(gen, indices)
 
 
 # =========================================================================
@@ -144,6 +209,9 @@ class SynthDriver(BaseSynthDriver):
         self._available_voices = OrderedDict()
         self._request_queue = queue.Queue()
         self._engine_loaded_event = threading.Event()
+        # Incremented on every cancel(); requests and onDone callbacks tagged
+        # with an older value are silently dropped.
+        self._speech_gen = 0
 
         self._scan_voices()
         self._worker_thread = _SynthQueueThread(driver=self)
@@ -287,7 +355,9 @@ class SynthDriver(BaseSynthDriver):
 
         full_text = "".join(text_parts)
         if full_text.strip() or pending_indices:
-            self._request_queue.put((full_text, self._current_voice_path, pending_indices))
+            self._request_queue.put(
+                (self._speech_gen, full_text, self._current_voice_path, pending_indices)
+            )
 
     def pause(self, switch):
         """Pause or resume playback. Called by NVDA when the user presses Shift."""
@@ -298,6 +368,7 @@ class SynthDriver(BaseSynthDriver):
                 pass
 
     def cancel(self):
+        self._speech_gen += 1
         self._worker_thread.cancel_event.set()
         if self._player:
             try:
@@ -312,7 +383,14 @@ class SynthDriver(BaseSynthDriver):
                 break
 
     def terminate(self):
+        self._speech_gen += 1
+        self._worker_thread.cancel_event.set()
         self._worker_thread.stop_event.set()
+        if self._player:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
         # Join the worker thread before releasing resources so it cannot
         # access _player or tts_engine after they have been freed.
         self._worker_thread.join(timeout=2.0)
