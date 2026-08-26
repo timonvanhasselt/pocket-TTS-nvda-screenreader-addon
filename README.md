@@ -6,3 +6,5 @@ Proof of concept NVDA screenreader 2026.1 addon for Pocket TTS from [Kyutai-labs
 * Using the int8 versions of the model to be so memory efficient as possible
 
 Disclaimer: This addon is fully software engineered with AI, Claude.ai and Google Gemini. It's been extensively manually tested in every step of the development in NVDA screenreader 2026, until it was ready for real user testing. 
+
+For v2 support of Pocket-TTS in NVDA see another free and open-source add-on https://github.com/jbgrimsby/sonata-sherpa-voices
